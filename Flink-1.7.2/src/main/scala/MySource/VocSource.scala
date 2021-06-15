@@ -1,0 +1,5 @@
+package MySource
+
+class VocSource {
+
+}

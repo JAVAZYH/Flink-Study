@@ -1,0 +1,3 @@
+# Project exclude paths
+/Flink-1.11/target/
+/Flink-1.12/target/

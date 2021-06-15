@@ -1,0 +1,458 @@
+package com.tencent.allblue.flink.udf_flowid_nodeid
+
+// AllBlue编译时会自动替换package
+
+import java.text.SimpleDateFormat
+import java.util
+
+import com.tencent.allblue.flink.task.{TaskRunner, TaskRunnerContext}
+import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.api.scala._
+import org.apache.flink.configuration.Configuration
+import org.apache.flink.streaming.api.environment.CheckpointConfig
+import org.apache.flink.streaming.api.functions.sink.{RichSinkFunction, SinkFunction}
+import org.apache.flink.streaming.api.scala.function.WindowFunction
+import org.apache.flink.streaming.api.scala.{DataStream, StreamExecutionEnvironment}
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.api.windowing.triggers.{Trigger, TriggerResult}
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow
+import org.apache.flink.types.Row
+import org.apache.flink.util.Collector
+import org.apache.hadoop.hbase._
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.util.Bytes
+import org.slf4j.LoggerFactory
+
+import scala.collection.mutable.ArrayBuffer
+
+/**
+  * 批量输出到HBase
+  * 输出到指定的HBase宽表，这个HBase宽表应该是建好的
+  */
+
+class TaskUserCodeRunner extends TaskRunner {
+
+  override def run(dataStreams: List[DataStream[Row]], context: TaskRunnerContext): DataStream[Row] = {
+
+    // 获取输出数据的RowType
+    implicit val rowType: TypeInformation[Row] = context.getOutRowTypes()
+
+    val env: StreamExecutionEnvironment = context.streamExecutionEnvironment
+    val checkpointConfig: CheckpointConfig = env.getCheckpointConfig
+    checkpointConfig.setCheckpointTimeout(20*60*1000L)
+    val LOG = LoggerFactory.getLogger(this.getClass)
+
+    //1分钟或者100条写入一次数据到hbase
+    val TIME="300".toLong
+    val maxCount="100".toInt
+    //key的位置，组合key按照|分割
+    val mainKeyPos=context.params.get("MAIN_KEY_POS")
+
+    val hbaseWideTableName=context.params.get("HBASE_WIDE_TABLE_NAME")
+    val hbaseTableName=context.params.get("HBASE_TABLE_NAME")
+    val timePos=context.params.get("TIME_POS")
+    //传入的数据格式
+    val inputColumn=context.params.get("INPUT_COLUMN")
+
+//    val expireTime=context.params.get("EXPIRE_TIME")
+
+//    val isPhoto=context.params.get("IS_PHOTO")
+
+    val lines: Array[String] = inputColumn.split(' ')
+    val columnNameArr: ArrayBuffer[String] = ArrayBuffer[String]()
+    for (elem <- lines) {
+      val dataArr: Array[String] = elem.split("\t")
+      //取重命名后的列名作为列名
+      columnNameArr.append(dataArr.head)
+    }
+
+
+    def transRowStreamToStringStream(rowStream: DataStream[Row]): DataStream[String] = {
+      val stringStream = rowStream.map(rows => {
+        var string = ""
+        for (pos <- 0 until rows.getArity) {
+          if (pos == 0)
+            string += rows.getField(pos)
+          else
+            string += "|" + rows.getField(pos)
+        }
+        string
+      })
+      stringStream
+    }
+
+    def stringToTimestamp(timeStr: String, format: String = "yyyy-MM-dd HH:mm:ss"): Long = {
+      val timeFormat = new SimpleDateFormat(format)
+      val timestamp = timeFormat.parse(timeStr).getTime
+      timestamp
+    }
+
+
+    //将string流转换为单个row流
+    def transStringStreamToOneRowStream(StringStream: DataStream[String]): DataStream[Row] = {
+      StringStream.map(str=>{
+        val rowResult=new Row(1)
+        rowResult.setField(0,str)
+        rowResult
+      })
+    }
+
+    class myTrigger extends Trigger[String,TimeWindow]{
+      var HBaseThreshold=0L
+      var currentCounts=0L
+
+      def this(HBaseThreshold: Int){
+        this()
+        this.HBaseThreshold=HBaseThreshold
+      }
+
+      //每个元素到达时要处理什么
+      override def onElement(element: String, timestamp: Long,
+                             window: TimeWindow, ctx: Trigger.TriggerContext): TriggerResult = {
+        //注册一个定时器为窗口的最大时间
+        ctx.registerProcessingTimeTimer(window.maxTimestamp())
+        currentCounts+=1
+        //如果当前的数量满足给定阈值
+        if(currentCounts>=HBaseThreshold){
+          currentCounts=0
+          //注册事件时间定时器
+          ctx.deleteEventTimeTimer(window.maxTimestamp())
+          //触发计算并且保留当前窗口
+          return TriggerResult.FIRE_AND_PURGE
+        }
+         TriggerResult.CONTINUE
+      }
+
+      //到达窗口结束时间
+      override def onProcessingTime(time: Long, window: TimeWindow, ctx: Trigger.TriggerContext): TriggerResult = {
+        if(currentCounts>0){
+          LOG.info("已到达窗口结束时间，触发计算"+currentCounts)
+          currentCounts=0
+          return TriggerResult.FIRE_AND_PURGE
+        }
+         TriggerResult.CONTINUE
+      }
+
+      override def onEventTime(time: Long, window: TimeWindow, ctx: Trigger.TriggerContext): TriggerResult = {
+        TriggerResult.CONTINUE
+      }
+
+      //清除窗口时需要做什么
+      override def clear(window: TimeWindow, ctx: Trigger.TriggerContext): Unit = {
+        ctx.deleteProcessingTimeTimer(window.maxTimestamp())
+      }
+
+    }
+
+    class HBaseSinkFunction extends RichSinkFunction[List[String]]{
+
+       var conf: org.apache.hadoop.conf.Configuration =_
+       var conn: Connection =_
+       var bufferedMutator: BufferedMutator =_
+
+      override def open(parameters: Configuration): Unit = {
+        super.open(parameters)
+        // 1. 先获取到hbase的连接
+        conf = HBaseConfiguration.create()
+         conf.set("hbase.zookeeper.quorum","ps-hbase-zk-1.tencent-distribute.com,ps-hbase-zk-2.tencent-distribute.com,ps-hbase-zk-3.tencent-distribute.com,ps-hbase-zk-4.tencent-distribute.com,ps-hbase-zk-5.tencent-distribute.com")
+        conf.set("hbase.zookeeper.property.clientPort","2181")
+        conf.set("zookeeper.znode.parent","/hbase_hy_security")
+        conn = ConnectionFactory.createConnection(conf)
+        //构建缓冲
+        val bufferedMutatorParams = new BufferedMutatorParams(TableName.valueOf(s"$hbaseWideTableName"))
+        //设置hbase写缓存，缓存2-5m比较合理
+        bufferedMutatorParams.writeBufferSize(4*1024*1024)
+        bufferedMutator=conn.getBufferedMutator(bufferedMutatorParams)
+      }
+
+      override def close(): Unit = {
+        super.close()
+        conn.close()
+        bufferedMutator.close()
+      }
+
+      override def invoke(list: List[String],
+                          context: SinkFunction.Context[_]): Unit = {
+        if(list.nonEmpty){
+          val putList = new util.ArrayList[Put]()
+          for (line <- list) {
+            val inputArr: Array[String] = line.split('|')
+            val mainArr: Array[String] = mainKeyPos.split('|')
+            var rowKey: String =""
+            for (index <- mainArr.indices) {
+              if(index==0){
+                rowKey+=inputArr(mainArr(index).toInt-1)
+              }
+              else{
+                rowKey+=rowKey+"_"+inputArr(mainArr(index).toInt-1)
+              }
+            }
+            val cf="c"
+            for(elemIndex<-inputArr.indices) {
+              val columnName = hbaseTableName + "_" + columnNameArr(elemIndex)
+              val columnValue = inputArr(elemIndex)
+              val timeValue = inputArr(timePos.toInt - 1)
+              val put = new Put(Bytes.toBytes(rowKey))
+              put.addColumn(Bytes.toBytes(cf), Bytes.toBytes(columnName),
+                stringToTimestamp(timeValue), Bytes.toBytes(columnValue))
+              putList.add(put)
+            }
+          }
+          bufferedMutator.mutate(putList)
+          bufferedMutator.flush()
+        }
+
+      }
+
+    }
+
+    val input_stream: DataStream[String] = transRowStreamToStringStream(dataStreams.head)
+
+    val windowDStream = input_stream
+      .keyBy(str => {
+        val arr: Array[String] = str.split('|')
+        val mainArr: Array[String] = mainKeyPos.split('|')
+        var key = ""
+        for (ele <- mainArr) {
+          key += arr(ele.toInt - 1)
+        }
+        key
+      })
+      .timeWindow(Time.seconds(TIME))
+      .trigger(new myTrigger(maxCount))
+      .apply((input: String, window: TimeWindow, list: Iterable[String], out: Collector[List[String]]) => {
+        out.collect(list.toList)
+      }
+      )
+
+    windowDStream.addSink(new HBaseSinkFunction )
+
+    //对数据开窗，要么满100条写一次hbase，或者窗口时间结束写一次hbase
+
+       //将多个row流转为一个row流
+    def transRowsStreamToRowStream(rowStream: DataStream[Row]): DataStream[Row] = {
+      val result_ds: DataStream[Row] = rowStream.map(rows => {
+        val result = new Row(1)
+        var str = ""
+        for (ele <- 0 until rows.getArity) {
+          if (ele == 0) {
+            str += rows.getField(ele)
+          }
+          else {
+            str += "|" + rows.getField(ele)
+          }
+        }
+        result.setField(0, str)
+        result
+      })
+      result_ds
+    }
+    transRowsStreamToRowStream(dataStreams.head)
+  }
+}
+
+
+package com.tencent.allblue.flink.udf_flowid_nodeid   // AllBlue编译时会自动替换package
+
+import java.text.SimpleDateFormat
+import java.util
+import java.util.Date
+import java.util.concurrent.{ExecutorService, Executors, TimeUnit}
+
+import com.tencent.allblue.flink.task.{TaskRunner, TaskRunnerContext}
+import com.tencent.allblue.flink.util.TimeUtil
+import org.apache.flink.api.common.typeinfo.TypeInformation
+import org.apache.flink.streaming.api.scala.async.{AsyncFunction, ResultFuture}
+import org.apache.flink.streaming.api.scala.{AsyncDataStream, DataStream}
+import org.apache.flink.types.Row
+import org.apache.flink.streaming.api.scala._
+import org.apache.hadoop.hbase.client._
+import org.apache.hadoop.hbase.filter.{BinaryComparator, ColumnPrefixFilter, CompareFilter, QualifierFilter, SingleColumnValueFilter}
+import org.apache.hadoop.hbase.io.compress.Compression.Algorithm
+import org.apache.hadoop.hbase.regionserver.BloomType
+import org.apache.hadoop.hbase.util.Bytes
+import org.apache.hadoop.hbase.{Cell, CellUtil, HBaseConfiguration, HColumnDescriptor, HTableDescriptor, NamespaceDescriptor, TableName}
+import org.slf4j.LoggerFactory
+
+import scala.collection.mutable.ArrayBuffer
+
+
+
+
+
+class AsyncIOTaskUserCodeRunner extends TaskRunner {
+
+  object HBaseUtil {
+    // 1. 先获取到hbase的连接
+    val conf=HBaseConfiguration.create()
+    //  conf.set("hbase.zookeeper.quorum","hadoop120,hadoop121,hadoop122")
+//    conf.set("hbase.zookeeper.quorum","9.134.217.5")
+//    conf.set("hbase.zookeeper.property.clientPort","2181")
+    conf.set("hbase.zookeeper.quorum","ps-hbase-zk-1.tencent-distribute.com,ps-hbase-zk-2.tencent-distribute.com,ps-hbase-zk-3.tencent-distribute.com,ps-hbase-zk-4.tencent-distribute.com,ps-hbase-zk-5.tencent-distribute.com")
+    conf.set("hbase.zookeeper.property.clientPort","2181")
+    conf.set("zookeeper.znode.parent","/hbase_hy_security")
+    val conn: Connection = ConnectionFactory.createConnection(conf)
+
+    /**
+      * 根据rowkey查询某个列族下符合某个列名的前缀的数据
+      * @param tableName
+      * @param rowKey
+      * @param cf
+      * @param columnName
+      * @return 返回字符串按照|进行分割
+      */
+    def getDataWithColumnName(tableName: String, rowKey: String, cf: String, columnName: String="",resultTemMap:util.LinkedHashMap[String,String]) = {
+      val table: Table = conn.getTable(TableName.valueOf(tableName))
+      val get = new Get(Bytes.toBytes(rowKey))
+      //过滤出列名的前缀为student的数据
+      val filter = new ColumnPrefixFilter(Bytes.toBytes(columnName))
+      get.setFilter(filter)
+      get.addFamily(Bytes.toBytes(cf))
+      val result: Result = table.get(get)
+      // 这个是用来在java的集合和scala的集合之间互转  (隐式转换)
+      import scala.collection.JavaConversions._
+      val cells: util.List[Cell] = result.listCells() // rawCells
+      var resultStr=""
+      if (cells != null) {
+        for (cell <- cells) {
+          resultTemMap.update(Bytes.toString(CellUtil.cloneQualifier(cell)),Bytes.toString(CellUtil.cloneValue(cell)))
+//          resultStr+="|"+s"""${Bytes.toString(CellUtil.cloneValue(cell))}""".stripMargin
+        }
+      }
+      table.close()
+      val resultList: List[String] = resultTemMap.values().toList
+      for (elem <- resultList) {
+        resultStr+="|"+elem
+      }
+      resultStr
+    }
+
+    def closeConnection() = conn.close()
+  }
+
+  object TimeUtil {
+    def timestampToString(timestamp: Long, format: String = "yyyy-MM-dd HH:mm:ss"): String = {
+      val timeFormat = new SimpleDateFormat(format)
+      val timeStr = timeFormat.format(new Date(timestamp))
+      timeStr
+    }
+
+    def stringToTimestamp(timeStr: String, format: String = "yyyy-MM-dd HH:mm:ss"): Long = {
+      val timeFormat = new SimpleDateFormat(format)
+      val timestamp = timeFormat.parse(timeStr).getTime
+      timestamp
+    }
+  }
+
+
+  override def run(dataStreams: List[DataStream[Row]], context: TaskRunnerContext): DataStream[Row] = {
+    // 获取输出数据的RowType
+    implicit val rowType: TypeInformation[Row] = context.getOutRowTypes()
+    val LOG = LoggerFactory.getLogger(this.getClass)
+    val joinTableName=context.params.get("JOIN_TABLE_NAME")
+    val row_key_pos=context.params.get("ROW_KEY_POS")
+    val HBASE_WIDE_TABLE_NAME=context.params.get("HBASE_WIDE_TABLE_NAME")
+    val INPUT_COLUMN=context.params.get("INPUT_COLUMN")
+
+    //这里需要获取到全部列名，主要是从hbase读取出来的数据和写入的时候顺序不一致，需要通过列名来进行匹配
+    val lines: Array[String] = INPUT_COLUMN.split(' ')
+    val resultTemMap = new util.LinkedHashMap[String,String]()
+    for (elem <- lines) {
+      val dataArr: Array[String] = elem.split("\\\\t")
+      resultTemMap.put(joinTableName+"_"+dataArr.head,"")
+    }
+
+
+    def transRowStreamToStringStream(rowStream: DataStream[Row]): DataStream[String] = {
+
+      val stringStream = rowStream.map(rows => {
+        var string = ""
+        for (pos <- 0 until rows.getArity) {
+          if (pos == 0)
+            string += rows.getField(pos)
+          else
+            string += "|" + rows.getField(pos)
+        }
+        string
+      })
+      stringStream
+    }
+
+    //将string流转换为单个row流
+    def transStringStreamToOneRowStream(StringStream: DataStream[String]): DataStream[Row] = {
+      StringStream.map(str=>{
+        val rowResult=new Row(1)
+        rowResult.setField(0,str)
+        rowResult
+      })
+    }
+
+
+
+    val input_ds: DataStream[String] =transRowStreamToStringStream(dataStreams.head)
+
+    class HBaseJoinAsyncFunction extends AsyncFunction[String,String] {
+      lazy val executorService:ExecutorService=Executors.newFixedThreadPool(100)
+
+      override def timeout(input: String, resultFuture: ResultFuture[String]): Unit = {
+        super.timeout(input,resultFuture)
+        //输出超时信息
+        LOG.error(s"输出超时，${input}timeout")
+        resultFuture.complete(Array[String](input))
+        executorService.shutdown()
+      }
+      override def asyncInvoke(input: String, resultFuture: ResultFuture[String]): Unit = {
+        executorService.submit(new Runnable {
+          override def run(): Unit = {
+            try {
+              //采用id+随机数作为rowkey
+              var row_key=""
+              val row_key_arr: Array[String] = row_key_pos.split('|')
+              val inputArr: Array[String] = input.split('|')
+
+              //根据传入的rowkey偏移构造rowkey
+              for (elem <- row_key_arr) {
+                //只有当传入的rowkey偏移小于输入数据的长度时才进行计算
+                if(elem.toInt<input.length) {
+                  row_key += inputArr(elem.toInt - 1).toString
+                }
+              }
+              val joinTableArr: Array[String] = joinTableName.split(",")
+              var hbaseStr=""
+              for (tableName <- joinTableArr) {
+                hbaseStr+= HBaseUtil.getDataWithColumnName(HBASE_WIDE_TABLE_NAME,row_key,"c",tableName,resultTemMap)
+              }
+              resultFuture.complete(Array(input+hbaseStr))
+            }
+            catch {
+              case e: Exception => {
+                LOG.error(e.printStackTrace().toString)
+                HBaseUtil.closeConnection()
+                LOG.error("程序出现异常，hbase连接池关闭，redis连接池关闭")
+              }
+            }
+          }
+        })
+//        executorService.shutdown()
+      }
+    }
+
+ /**
+      *输入流
+      * 异步函数
+      * 超时等待时间
+      * 时间单位
+      * 容量=允许的并发数,超过10个请求就会反压之前的节点、
+  * 异步io主要做的事情是从hbase中查询数据进行关联然后输出到下一个流水中
+  * 关联是否有必要加入redis进行二级缓存还待定
+      */
+
+    val result: DataStream[String] = AsyncDataStream
+      .unorderedWait(input_ds,new HBaseJoinAsyncFunction,60,TimeUnit.SECONDS,100)
+
+
+    // 返回类型为DataStream[Row]的结果
+    val output_stream: DataStream[Row] = transStringStreamToOneRowStream(result)
+    output_stream
+  }
+}
