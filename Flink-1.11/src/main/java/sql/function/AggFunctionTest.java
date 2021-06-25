@@ -8,7 +8,7 @@ import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.table.functions.AggregateFunction;
 
 
-//flink 1.11 版本有bug无法注册udtf，切换到1.12版本解决
+//flink 1.11-2.11 版本有bug无法注册udtf，切换到1.12版本解决
 public class AggFunctionTest {
     public static class VcAvgAcc {
         public Integer sum = 0;
