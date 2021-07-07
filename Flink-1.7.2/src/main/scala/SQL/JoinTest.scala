@@ -91,7 +91,7 @@ object JoinTest {
     val dubious_stream: DataStream[Row] = TypeUtil.transStringStreamToRowStream(env.addSource(new DubiousSource),
       "string,string")
 
-    val report_stream: DataStream[Row] = TypeUtil.transStringStreamToRowStream(env.addSource(new MySource.ReportSource),
+    val report_stream: DataStream[Row] = TypeUtil.transStringStreamToRowStream(env.addSource(new MySuorce.ReportSource),
       "string,string,string")
 
     import org.apache.flink.table.api.scala._

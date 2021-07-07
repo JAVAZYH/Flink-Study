@@ -27,6 +27,11 @@
       <option name="url" value="https://repo1.maven.org/maven2" />
     </remote-repository>
     <remote-repository>
+      <option name="id" value="nexus" />
+      <option name="name" value="nexus" />
+      <option name="url" value="http://hub.lzhaohao.info:11081/repository/maven-public/" />
+    </remote-repository>
+    <remote-repository>
       <option name="id" value="oa.com.thirdparty" />
       <option name="name" value="oa.com.thirdparty" />
       <option name="url" value="https://mirrors.cloud.tencent.com/repository/maven/thirdparty-snapshots" />
